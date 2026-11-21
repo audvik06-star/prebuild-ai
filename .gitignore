@@ -1,0 +1,4 @@
+.env
+.venv/
+_pycache_/
+contractor_credits.json
