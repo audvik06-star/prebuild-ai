@@ -2,6 +2,7 @@ import os
 import threading
 import time
 import urllib.parse
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -89,10 +90,13 @@ if not supabase:
     st.error("Cloud database not configured. Add SUPABASE_URL and SUPABASE_KEY in Secrets.")
     st.stop()
 
-# 1. Read permanent Device ID from PWA wrapper
+# 1. Read permanent Device ID from PWA wrapper (or auto-create one for direct laptop access)
 device_id = str(st.query_params.get("device_id", ""))
+if not device_id:
+    device_id = f"laptop-{uuid.uuid4().hex[:12]}"
+    st.query_params["device_id"] = device_id
 
-# 2. Auto-login if phone is already linked (survives app swipe & refresh)
+# 2. Auto-login if phone/device is already linked (survives app swipe & refresh)
 if "contractor" not in st.session_state or st.session_state.contractor is None:
     if device_id:
         saved_user = auto_login_by_device(supabase, device_id)
