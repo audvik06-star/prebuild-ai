@@ -1,448 +1,341 @@
 import os
-import json
-import time
 import threading
+import time
 import urllib.parse
-from datetime import datetime
-import streamlit as st
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
 import fitz  # PyMuPDF
+import streamlit as st
 from dotenv import load_dotenv
-from core.risk_engine import detect_risks
+from google import genai
+from supabase import Client, create_client
+
+from core.auth_db import (
+    MOBILE_COL,
+    auto_login_by_device,
+    login_or_register_contractor,
+    update_job_status,
+)
 
 load_dotenv()
 
-# 1. Page Configuration
 st.set_page_config(
-    page_title="PreBuild AI | Contractor Profit & Risk Analyzer",
-    page_icon="🏗️",
-    layout="wide"
+    page_title="PreBuild AI",
+    page_icon="icon.png" if os.path.exists("icon.png") else "🏗️",
+    layout="centered",
+    initial_sidebar_state="collapsed",
 )
 
-# 2. Cloud Database (Supabase) + Automatic Local Fallback
-DB_FILE = "contractor_credits.json"
-
-def get_secret(key: str, default: str = "") -> str:
-    try:
-        if key in st.secrets:
-            return str(st.secrets[key]).strip()
-    except Exception:
-        pass
-    return os.getenv(key, default).strip()
-
-SUPABASE_URL = get_secret("SUPABASE_URL")
-SUPABASE_KEY = get_secret("SUPABASE_KEY")
-
-@st.cache_resource
-def init_supabase():
-    if SUPABASE_URL and SUPABASE_KEY:
-        try:
-            from supabase import create_client
-            return create_client(SUPABASE_URL, SUPABASE_KEY)
-        except Exception:
-            return None
-    return None
-
-sb = init_supabase()
-
-def _load_local() -> dict:
-    if os.path.exists(DB_FILE):
-        try:
-            with open(DB_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
-
-def _save_local(data: dict) -> None:
-    with open(DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-def get_user_record(mobile: str) -> dict:
-    if sb:
-        try:
-            res = sb.table("contractors").select("*").eq("mobile", mobile).execute()
-            if res.data:
-                return res.data[0]
-            new_row = {
-                "mobile": mobile,
-                "credits": 1,
-                "plan": "Instant Free Trial (1 Tender)",
-                "job_status": "idle",
-                "job_file": "",
-                "job_error": "",
-                "history": []
-            }
-            sb.table("contractors").insert(new_row).execute()
-            return new_row
-        except Exception:
-            pass
-
-    db = _load_local()
-    if mobile not in db:
-        db[mobile] = {
-            "mobile": mobile,
-            "credits": 1,
-            "plan": "Instant Free Trial (1 Tender)",
-            "job_status": "idle",
-            "job_file": "",
-            "job_error": "",
-            "history": []
-        }
-        _save_local(db)
-    return db[mobile]
-
-def update_user_record(mobile: str, fields: dict) -> None:
-    if sb:
-        try:
-            sb.table("contractors").update(fields).eq("mobile", mobile).execute()
-            return
-        except Exception:
-            pass
-
-    db = _load_local()
-    if mobile not in db:
-        db[mobile] = {"mobile": mobile}
-    db[mobile].update(fields)
-    _save_local(db)
-
-def is_code_used(code: str) -> bool:
-    if sb:
-        try:
-            res = sb.table("used_codes").select("code").eq("code", code).execute()
-            return len(res.data) > 0
-        except Exception:
-            pass
-    db = _load_local()
-    return code in db.get("_used_codes", [])
-
-def mark_code_used(code: str, mobile: str) -> None:
-    if sb:
-        try:
-            sb.table("used_codes").insert({"code": code, "used_by": mobile}).execute()
-            return
-        except Exception:
-            pass
-    db = _load_local()
-    used = db.get("_used_codes", [])
-    if code not in used:
-        used.append(code)
-    db["_used_codes"] = used
-    _save_local(db)
-
-# 3. Indian Mobile Number Validation & One-Time Unlock Codes
-def is_valid_indian_mobile(num: str) -> bool:
-    if len(num) != 10 or not num.isdigit():
-        return False
-    if num[0] not in ("6", "7", "8", "9"):
-        return False
-    if len(set(num)) <= 2:
-        return False
-    if num in ("9876543210", "6789012345", "9123456789"):
-        return False
-    return True
-
-UNLOCK_CODES = {
-    # WhatsApp-verified 2nd Free Trial Codes
-    "FREE2-101": {"credits": 1, "plan": "WhatsApp Verified Bonus Trial (1 Tender)"},
-    "FREE2-102": {"credits": 1, "plan": "WhatsApp Verified Bonus Trial (1 Tender)"},
-    "FREE2-103": {"credits": 1, "plan": "WhatsApp Verified Bonus Trial (1 Tender)"},
-    "FREE2-104": {"credits": 1, "plan": "WhatsApp Verified Bonus Trial (1 Tender)"},
-    "FREE2-105": {"credits": 1, "plan": "WhatsApp Verified Bonus Trial (1 Tender)"},
-
-    # ₹999/Month Pro Codes (15 Tenders)
-    "KNR999-101": {"credits": 15, "plan": "Contractor Pro (₹999/Month - 15 Tenders)"},
-    "KNR999-102": {"credits": 15, "plan": "Contractor Pro (₹999/Month - 15 Tenders)"},
-    "KNR999-103": {"credits": 15, "plan": "Contractor Pro (₹999/Month - 15 Tenders)"},
-    "KNR999-104": {"credits": 15, "plan": "Contractor Pro (₹999/Month - 15 Tenders)"},
-    "KNR999-105": {"credits": 15, "plan": "Contractor Pro (₹999/Month - 15 Tenders)"},
-
-    # ₹199 Single Pass Codes (1 Tender)
-    "KNR199-201": {"credits": 1, "plan": "Single Tender Pass (₹199 - 1 Tender)"},
-    "KNR199-202": {"credits": 1, "plan": "Single Tender Pass (₹199 - 1 Tender)"},
-
-    # Founder Personal Demo Code
-    "CHIDU2026": {"credits": 999, "plan": "Founder Unlimited Demo Access"},
-}
-
-# 4. Background Worker Thread (Continues Even If User Switches Apps on Mobile)
-def run_background_analysis(mobile: str, pdf_bytes: bytes, file_name: str):
-    try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        extracted_text = ""
-        for page_num, page in enumerate(doc, start=1):
-            extracted_text += f"\n--- Page {page_num} ---\n" + page.get_text()
-
-        report = detect_risks(extracted_text, pdf_bytes=pdf_bytes)
-
-        if report.startswith("❌"):
-            update_user_record(mobile, {
-                "job_status": "error",
-                "job_error": report
-            })
-            return
-
-        current_user = get_user_record(mobile)
-        new_credits = max(0, int(current_user.get("credits", 1)) - 1)
-        history = current_user.get("history") or []
-        history.insert(0, {
-            "file": file_name,
-            "timestamp": datetime.now().strftime("%d %b %Y, %I:%M %p"),
-            "report": report
-        })
-
-        update_user_record(mobile, {
-            "credits": new_credits,
-            "job_status": "done",
-            "job_error": "",
-            "history": history[:15]  # Saves up to 15 tender reports in cloud history
-        })
-    except Exception as exc:
-        update_user_record(mobile, {
-            "job_status": "error",
-            "job_error": f"❌ Analysis failed: {str(exc)}"
-        })
-
-# 5. Mobile-Responsive Blueprint UI Styling
-st.markdown("""
+# Pure #000000 dark theme & clean mobile layout
+st.markdown(
+    """
     <style>
-    .stApp {
-        background-color: #0B1120;
-        background-image: 
-            radial-gradient(circle at 15% 15%, rgba(245, 158, 11, 0.08), transparent 40%),
-            linear-gradient(rgba(56, 189, 248, 0.05) 1px, transparent 1px),
-            linear-gradient(90deg, rgba(56, 189, 248, 0.05) 1px, transparent 1px);
-        background-size: 100% 100%, 36px 36px, 36px 36px;
-        color: #F8FAFC;
+    .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
+        background-color: #000000 !important;
+        color: #FFFFFF !important;
     }
-    header[data-testid="stHeader"] {
-        background: transparent;
+    #MainMenu, footer, header, [data-testid="stToolbar"], [data-testid="stDecoration"] {
+        visibility: hidden !important;
+        height: 0 !important;
     }
     .block-container {
-        padding-top: 3.2rem !important;
+        padding-top: 1.2rem !important;
+        padding-bottom: 3rem !important;
+        max-width: 680px !important;
     }
-    .hero-box {
-        background: linear-gradient(135deg, #111827 0%, #1E293B 100%);
-        border: 1px solid rgba(245, 158, 11, 0.35);
-        border-left: 6px solid #F59E0B;
-        border-radius: 12px;
-        padding: 18px 20px;
-        margin-bottom: 18px;
-        box-shadow: 0 10px 25px rgba(0, 0, 0, 0.35);
-    }
-    .hero-badge {
-        display: inline-block;
-        background: rgba(245, 158, 11, 0.15);
-        color: #FBBF24;
-        font-size: 11px;
-        font-weight: 700;
-        letter-spacing: 1px;
-        padding: 4px 10px;
-        border-radius: 6px;
-        margin-bottom: 8px;
-        text-transform: uppercase;
-    }
-    .hero-title {
-        font-size: 26px;
-        font-weight: 800;
-        color: #FFFFFF;
-        margin: 0 0 6px 0;
-    }
-    .hero-subtitle {
-        font-size: 14px;
-        color: #CBD5E1;
-        margin: 0;
-    }
-    [data-testid="stFileUploader"] {
-        background-color: rgba(30, 41, 59, 0.75);
-        border: 1px dashed #F59E0B;
-        border-radius: 12px;
-        padding: 14px;
-    }
-    .stButton > button {
-        background: linear-gradient(90deg, #F59E0B 0%, #D97706 100%);
-        color: #0B1120;
-        font-weight: 700;
-        font-size: 16px;
-        border: none;
-        border-radius: 8px;
-        padding: 10px 24px;
-        width: 100%;
-    }
-    .report-card {
-        background-color: rgba(15, 23, 42, 0.92);
-        border: 1px solid #334155;
-        border-radius: 12px;
-        padding: 20px;
-        margin-top: 16px;
-    }
-    .paywall-box {
-        background: linear-gradient(135deg, #1E1B18 0%, #292018 100%);
-        border: 1px solid #F59E0B;
-        border-radius: 12px;
-        padding: 20px;
-        margin-top: 16px;
-    }
-    .wa-btn {
-        display: inline-block;
-        background-color: #25D366;
-        color: #0B1120 !important;
-        font-weight: 700;
-        padding: 11px 18px;
-        border-radius: 8px;
-        text-decoration: none;
-        margin-top: 10px;
-        margin-bottom: 12px;
-        text-align: center;
+    div[data-testid="stForm"] {
+        background-color: #0A0A0A !important;
+        border: 1px solid #262626 !important;
+        border-radius: 14px !important;
+        padding: 1.1rem !important;
     }
     </style>
-""", unsafe_allow_html=True)
+    """,
+    unsafe_allow_html=True,
+)
 
-# 6. Header Banner
-st.markdown("""
-    <div class="hero-box">
-        <div class="hero-badge">🏗️ Telangana Civil Tender Intelligence</div>
-        <div class="hero-title">PreBuild AI — Profit & Risk Analyzer</div>
-        <p class="hero-subtitle">
-            Upload any government tender or contract PDF (English, Telugu, or Scanned) to uncover 
-            hidden tax traps, unclaimed allowances, and profit-saving actions in <b>English & Telugu</b>.
-        </p>
-    </div>
-""", unsafe_allow_html=True)
 
-# 7. Contractor Mobile Number Input
-col1, col2 = st.columns([2, 1])
-with col1:
-    mobile = st.text_input(
-        "📱 Enter Contractor Mobile Number (10 digits) / కాంట్రాక్టర్ మొబైల్ నంబర్:",
-        max_chars=10,
-        placeholder="Enter 10-digit mobile number"
-    ).strip()
+def get_secret(key: str) -> str:
+    try:
+        if key in st.secrets:
+            return str(st.secrets[key])
+    except Exception:
+        pass
+    return os.getenv(key, "")
 
-if is_valid_indian_mobile(mobile):
-    user_info = get_user_record(mobile)
-    remaining = int(user_info.get("credits", 0))
-    job_status = user_info.get("job_status", "idle")
-    job_file = user_info.get("job_file", "")
-    job_error = user_info.get("job_error", "")
-    history = user_info.get("history") or []
 
-    with col2:
-        st.metric(label="🎟️ Credits Left", value=f"{remaining} Tenders")
+@st.cache_resource
+def init_supabase() -> Optional[Client]:
+    url = get_secret("SUPABASE_URL")
+    key = get_secret("SUPABASE_KEY")
+    if url and key:
+        return create_client(url, key)
+    return None
 
-    # 8. Background Job Status Banner (Auto-Polls Until Done)
-    if job_status == "processing":
-        st.info(f"⏳ *Analyzing {job_file} in the background...* You can safely switch apps; your report will be saved automatically when ready.")
-        if st.button("🔄 Refresh Result Now"):
-            st.rerun()
-        time.sleep(3)
-        st.rerun()
 
-    elif job_status == "error" and job_error:
-        st.error(job_error)
-        update_user_record(mobile, {"job_status": "idle", "job_error": ""})
+supabase = init_supabase()
 
-    # 9. Upload & Trigger Background Analysis (When Credits > 0 & Idle)
-    elif remaining > 0:
-        st.caption(f"Active Plan: *{user_info.get('plan', 'Free Trial')}* • Cloud Sync: *{'🟢 Active' if sb else '🟡 Local'}*")
-        uploaded_file = st.file_uploader("Upload Tender / Contract PDF", type=["pdf"])
+# Header with custom logo
+col_logo, col_title = st.columns([1, 5])
+with col_logo:
+    if os.path.exists("icon.png"):
+        st.image("icon.png", width=56)
+with col_title:
+    st.markdown("### PreBuild AI")
+    st.caption("Construction Tender Profit & Risk Analyzer (English + తెలుగు)")
 
-        if uploaded_file is not None:
-            if st.button("🚀 Maximize Profit & Analyze Tender"):
-                pdf_bytes = uploaded_file.read()
-                file_name = uploaded_file.name
-                update_user_record(mobile, {
-                    "job_status": "processing",
-                    "job_file": file_name,
-                    "job_error": ""
-                })
-                worker = threading.Thread(
-                    target=run_background_analysis,
-                    args=(mobile, pdf_bytes, file_name),
-                    daemon=True
-                )
-                worker.start()
-                st.rerun()
+if not supabase:
+    st.error("Cloud database not configured. Add SUPABASE_URL and SUPABASE_KEY in Secrets.")
+    st.stop()
 
-    # 10. Cloud Report History + 1-Tap WhatsApp Share
-    if history:
-        st.markdown("### 📂 Saved Tender Reports (Cloud History)")
-        selected_idx = st.selectbox(
-            "Select a tender report:",
-            range(len(history)),
-            format_func=lambda i: f"{i + 1}. {history[i].get('file', 'Tender.pdf')} ({history[i].get('timestamp', '')})"
+# 1. Read permanent Device ID from PWA wrapper
+device_id = str(st.query_params.get("device_id", ""))
+
+# 2. Auto-login if phone is already linked (survives app swipe & refresh)
+if "contractor" not in st.session_state or st.session_state.contractor is None:
+    if device_id:
+        saved_user = auto_login_by_device(supabase, device_id)
+        if saved_user:
+            st.session_state.contractor = saved_user
+
+# 3. Login / Registration Gate with Full-Width ENTER Button
+if not st.session_state.get("contractor"):
+    st.subheader("🔐 Contractor Login / Register")
+    st.caption(
+        "First time? Type your 10-digit mobile number and create a 4-digit secret PIN. "
+        "Your account locks to this phone (1 number = 1 mobile)."
+    )
+
+    with st.form("mobile_login_form", clear_on_submit=False):
+        mobile_input = st.text_input(
+            "10-Digit Mobile Number",
+            max_chars=10,
+            placeholder="e.g. 9848012345",
         )
-        active_item = history[selected_idx]
-        active_file = active_item.get("file", "Tender.pdf")
-        active_report = active_item.get("report", "")
+        pin_input = st.text_input(
+            "4-Digit Secret PIN",
+            type="password",
+            max_chars=4,
+            placeholder="e.g. 4521",
+        )
+        enter_clicked = st.form_submit_button(
+            "Enter PreBuild AI →",
+            type="primary",
+            use_container_width=True,
+        )
 
-        st.markdown('<div class="report-card">', unsafe_allow_html=True)
-        st.subheader(f"📊 Profit Protection Report ({active_file})")
-        st.markdown(active_report)
-        st.markdown('</div>', unsafe_allow_html=True)
+    if enter_clicked:
+        ok, msg, user_row = login_or_register_contractor(
+            supabase, mobile_input, pin_input, device_id
+        )
+        if ok:
+            st.session_state.contractor = user_row
+            st.success(msg)
+            st.rerun()
+        else:
+            st.error(msg)
+    st.stop()
 
-        dl_col, wa_col = st.columns(2)
-        with dl_col:
-            st.download_button(
-                label="📥 Download Full Report (.txt)",
-                data=active_report,
-                file_name=f"PreBuild_Report_{active_file}.txt",
-                mime="text/plain"
-            )
-        with wa_col:
-            wa_report_text = (
-                f"🏗️ PreBuild AI Profit Report ({active_file})\n\n"
-                f"{active_report[:1500]}\n\n"
-                f"🔗 Analyze your tenders: https://prebuild-ai.streamlit.app"
-            )
-            encoded_report = urllib.parse.quote(wa_report_text)
-            st.markdown(
-                f'<a class="wa-btn" href="https://api.whatsapp.com/send?text={encoded_report}" target="_blank">📲 Share Report on WhatsApp</a>',
-                unsafe_allow_html=True
-            )
+# 4. Refresh latest contractor state from Supabase
+contractor: Dict[str, Any] = st.session_state.contractor
+mobile = str(contractor[MOBILE_COL])
 
-    # 11. Paywall + WhatsApp Verification Screen (Shown When Credits == 0)
-    if remaining <= 0 and job_status != "processing":
-        wa_message = f"Hi%20PreBuild%20AI,%20my%20mobile%20number%20is%20{mobile}.%20Please%20send%20my%20unlock%20code."
-        wa_link = f"https://wa.me/918977744001?text={wa_message}"
+fresh_res = supabase.table("contractors").select("*").eq(MOBILE_COL, mobile).limit(1).execute()
+if fresh_res.data:
+    contractor = fresh_res.data[0]
+    st.session_state.contractor = contractor
 
-        st.markdown(f"""
-            <div class="paywall-box">
-                <h3>🔒 Free Trial Completed — Unlock More Tender Reports</h3>
-                <p>మీ ఉచిత టెండర్ రిపోర్ట్ పూర్తయింది. మరిన్ని ₹10 లక్షల కాంట్రాక్టుల లాభం మరియు ట్యాక్స్ వివరాల కోసం:</p>
-                <ul>
-                    <li><b>2nd Free Bonus Report:</b> Verify your real WhatsApp number below to get <b>1 more FREE report</b>.</li>
-                    <li><b>Contractor Pro (₹999 / Month):</b> 15 Tender Analyses + Scanned Telugu PDF Support + Cloud History</li>
-                    <li><b>Single Tender Pass (₹199):</b> 1 Tender Analysis Report</li>
-                </ul>
-                <p><b>Step 1:</b> Pay ₹999 (or ₹199) via PhonePe / GPay to <b>8977744001@ybl</b>, OR verify for your 2nd free report on WhatsApp:</p>
-                <a class="wa-btn" href="{wa_link}" target="_blank">📲 Send Number on WhatsApp for Unlock Code</a>
-                <p><b>Step 2:</b> Enter the 1-time Unlock Code you receive on WhatsApp below:</p>
-            </div>
-        """, unsafe_allow_html=True)
+credits = int(contractor.get("credits") or 0)
+history: List[Dict[str, Any]] = contractor.get("history") or []
 
-        code_col1, code_col2 = st.columns([2, 1])
-        with code_col1:
-            entered_code = st.text_input("🔑 Enter 1-Time Unlock Code:", placeholder="Enter code sent on WhatsApp").strip().upper()
-        with code_col2:
-            st.write("")
-            st.write("")
-            if st.button("✅ Activate Plan"):
-                if entered_code != "CHIDU2026" and is_code_used(entered_code):
-                    st.error("❌ This code was already used once. Contact us on WhatsApp for a new code.")
-                elif entered_code in UNLOCK_CODES:
-                    pack = UNLOCK_CODES[entered_code]
-                    update_user_record(mobile, {
-                        "credits": remaining + pack["credits"],
-                        "plan": pack["plan"]
-                    })
-                    if entered_code != "CHIDU2026":
-                        mark_code_used(entered_code, mobile)
-                    st.success(f"🎉 Activated {pack['plan']}! Reloading...")
-                    st.rerun()
-                else:
-                    st.error("❌ Invalid Unlock Code. Tap the green WhatsApp button above to get your code.")
+# Top Status Bar
+c1, c2, c3 = st.columns([2, 2, 1])
+c1.markdown(f"*📱 {mobile}*")
+c2.markdown(f"*🎟️ Credits: {credits}*")
+if c3.button("Lock", use_container_width=True):
+    st.session_state.contractor = None
+    st.rerun()
 
-elif mobile:
-    st.error("❌ Please enter a real 10-digit Indian mobile number (starting with 6, 7, 8, or 9). Dummy numbers like 9999999999 are blocked.")
+st.divider()
+
+# 5. Auto-Resume Background Job if contractor swiped away mid-analysis
+if contractor.get("job_status") == "processing":
+    active_name = (
+        contractor.get("last_job_filename")
+        or contractor.get("job_file")
+        or "your tender"
+    )
+    st.info(
+        f"⏳ Analyzing *{active_name}* in the background... "
+        "You can safely minimize the app and return in 20 seconds."
+    )
+    time.sleep(4)
+    st.rerun()
+
+
+def extract_pdf_text(pdf_bytes: bytes) -> str:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    pages: List[str] = []
+    for idx, page in enumerate(doc, start=1):
+        txt = page.get_text("text").strip()
+        if txt:
+            pages.append(f"--- PDF Page {idx} ---\n{txt}")
+    return "\n\n".join(pages)
+
+
+def run_gemini_analysis(pdf_text: str) -> str:
+    api_key = get_secret("GEMINI_API_KEY")
+    client = genai.Client(api_key=api_key)
+    prompt = f"""
+You are a Senior Civil Construction Contract & Tender Risk Advisor for Telangana municipal and government contractors.
+Analyze the following tender document and produce a clear, bilingual (English + Telugu) Contractor Profit & Risk Report.
+
+Rules:
+- Cite exact Clause numbers (e.g., Clause 2.54, Clause 3.92) rather than shifted PDF page numbers.
+- Explicitly check and warn about:
+  1. GST-inclusive vs GST-exclusive rates, 2% GST TDS, 1% BOCW Labour Cess, IT TDS, and Seigniorage/Royalty deductions.
+  2. Price escalation availability, Municipal Area Labour Allowance rules (warn if 20% allowance is NOT automatic), and Base Quarry Lead (e.g., 5 km base lead).
+  3. Liquidated Damages (weekly penalty % and max cap), >5% Variation prior written approval rule, and 48-hour written Hindrance Notice rule.
+  4. Exact EMD, FSD, Additional Performance Security (APS), and Retention Money % + Defect Liability Period lock-in duration.
+  5. Mandatory Cover-I Before-You-Bid Document Checklist.
+
+Use these exact 5 headings with both English and Telugu bullet points under each:
+### 1. 💰 Profit Protection & GST Check (లాభం రక్షణ & GST తనిఖీ)
+### 2. 📈 Extra Money & Allowances to Claim (క్లెయిమ్ చేసుకోవాల్సిన అదనపు డబ్బు & అలవెన్సులు)
+### 3. ⚠️ Hidden Traps & Penalty Clauses (దాగి ఉన్న నష్టాలు & పెనాల్టీ నిబంధనలు)
+### 4. 🔒 Deposits & Cash Lock-in (డిపాజిట్లు & ఆగిపోయే నగదు వివరాలు)
+### 5. ✅ Before-You-Bid Checklist (టెండర్ వేసే ముందు తప్పనిసరి చెక్‌లిస్ట్)
+
+TENDER DOCUMENT TEXT:
+{pdf_text[:180000]}
+"""
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+    )
+    return response.text or "No analysis generated."
+
+
+def background_worker(
+    sb_url: str,
+    sb_key: str,
+    user_mobile: str,
+    filename: str,
+    pdf_bytes: bytes,
+    current_credits: int,
+    existing_history: List[Dict[str, Any]],
+) -> None:
+    worker_sb = create_client(sb_url, sb_key)
+    try:
+        raw_text = extract_pdf_text(pdf_bytes)
+        report_md = run_gemini_analysis(raw_text)
+
+        new_entry = {
+            "filename": filename,
+            "created_at": datetime.now(timezone.utc).strftime("%d %b %Y, %I:%M %p"),
+            "report": report_md,
+        }
+        updated_history = [new_entry] + existing_history[:14]
+
+        worker_sb.table("contractors").update(
+            {
+                "credits": max(0, current_credits - 1),
+                "history": updated_history,
+                "job_status": "completed",
+                "job_error": "",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        ).eq(MOBILE_COL, user_mobile).execute()
+    except Exception as exc:
+        err_msg = str(exc)[:100]
+        worker_sb.table("contractors").update(
+            {
+                "job_status": "failed",
+                "job_error": err_msg,
+                "last_job_filename": f"{filename} (Error: {err_msg})",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        ).eq(MOBILE_COL, user_mobile).execute()
+
+
+# 6. Upload & Background Analyze Section
+st.subheader("📄 Upload Tender PDF")
+
+if contractor.get("job_status") == "failed":
+    st.error(
+        f"Last scan failed: {contractor.get('last_job_filename', '')}. No credit was deducted."
+    )
+
+if credits <= 0:
+    st.warning("You have 0 credits left. Recharge ₹999 for 15 Tender Analyses via WhatsApp.")
+    wa_recharge = urllib.parse.quote(
+        f"Hi PreBuild AI, I want to recharge ₹999 (15 credits) for mobile {mobile}."
+    )
+    st.link_button(
+        "💳 Recharge ₹999 on WhatsApp",
+        f"https://wa.me/?text={wa_recharge}",
+        use_container_width=True,
+    )
 else:
-    st.info("👆 Enter your real 10-digit mobile number above to start your *FREE Tender Profit Report*.")
+    uploaded_file = st.file_uploader("Select Tender PDF", type=["pdf"])
+    if uploaded_file is not None:
+        if st.button(
+            "🚀 Maximize Profit & Analyze Tender",
+            type="primary",
+            use_container_width=True,
+        ):
+            pdf_data = uploaded_file.read()
+            update_job_status(supabase, mobile, "processing", uploaded_file.name)
+
+            thread = threading.Thread(
+                target=background_worker,
+                args=(
+                    get_secret("SUPABASE_URL"),
+                    get_secret("SUPABASE_KEY"),
+                    mobile,
+                    uploaded_file.name,
+                    pdf_data,
+                    credits,
+                    history,
+                ),
+                daemon=True,
+            )
+            thread.start()
+            st.rerun()
+
+# 7. Saved Cloud Reports + 1-Tap WhatsApp Sharing
+if history:
+    st.divider()
+    st.subheader("📂 Saved Tender Reports (Cloud History)")
+
+    report_titles = [
+        f"{item.get('filename', 'Tender')} — {item.get('created_at', item.get('date', ''))}"
+        for item in history
+    ]
+    selected_idx = st.selectbox(
+        "Select Report",
+        range(len(report_titles)),
+        format_func=lambda i: report_titles[i],
+    )
+    selected_item = history[selected_idx]
+    report_text = str(selected_item.get("report", ""))
+
+    wa_summary = urllib.parse.quote(
+        f"PreBuild AI Tender Report — {selected_item.get('filename', '')}\n\n"
+        f"{report_text[:3200]}\n\n_Generated by PreBuild AI_"
+    )
+    st.link_button(
+        "📲 Share Report on WhatsApp",
+        f"https://wa.me/?text={wa_summary}",
+        use_container_width=True,
+    )
+    st.download_button(
+        "⬇️ Download Report (.txt)",
+        data=report_text,
+        file_name=f"PreBuild_Report_{selected_item.get('filename', 'tender')}.txt",
+        mime="text/plain",
+        use_container_width=True,
+    )
+
+    st.markdown(report_text)
