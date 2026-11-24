@@ -1,133 +1,166 @@
 import hashlib
-import hmac
-import re
-import secrets
-from datetime import datetime, timezone
-from typing import Any, Optional, Tuple
-from supabase import Client
+import os
+import time
+from typing import Any, Optional
 
-MOBILE_COL = "mobile"  # Change to "phone" if your Supabase column is named "phone"
-FREE_STARTER_CREDITS = 2
+import httpx
+import streamlit as st
+from dotenv import load_dotenv
+from supabase import Client, create_client
 
-
-def is_valid_indian_mobile(mobile: str) -> bool:
-    return bool(re.fullmatch(r"[6-9]\d{9}", mobile.strip()))
+load_dotenv(override=True)
 
 
-def is_valid_pin(pin: str) -> bool:
-    return bool(re.fullmatch(r"\d{4}", pin.strip()))
-
-
-def hash_pin(pin: str) -> str:
-    salt = secrets.token_hex(16)
-    dk = hashlib.pbkdf2_hmac("sha256", pin.encode("utf-8"), salt.encode("utf-8"), 100_000)
-    return f"{salt}${dk.hex()}"
-
-
-def verify_pin(pin: str, stored_hash: str) -> bool:
+def get_config_value(key: str) -> str:
+    """Read a secret from Streamlit Cloud Secrets first, then fallback to .env."""
+    value = ""
     try:
-        salt, expected_hex = stored_hash.split("$", 1)
-        dk = hashlib.pbkdf2_hmac("sha256", pin.encode("utf-8"), salt.encode("utf-8"), 100_000)
-        return hmac.compare_digest(dk.hex(), expected_hex)
+        if key in st.secrets:
+            value = str(st.secrets[key])
     except Exception:
-        return False
+        value = ""
+
+    if not value:
+        value = os.getenv(key, "")
+
+    return value.strip().strip('"').strip("'")
+
+
+def init_supabase() -> Client:
+    """Initialize and validate the Supabase client."""
+    url = get_config_value("SUPABASE_URL")
+    key = get_config_value("SUPABASE_KEY")
+
+    if not url or not url.startswith("https://") or ".supabase.co" not in url:
+        raise ValueError(
+            "Invalid or missing SUPABASE_URL. Expected format: https://<project-id>.supabase.co"
+        )
+    if not key:
+        raise ValueError("Missing SUPABASE_KEY in Secrets or .env.")
+
+    return create_client(url, key)
+
+
+def hash_pin(mobile: str, pin: str) -> str:
+    """Create a salted SHA-256 hash of the contractor's 4-digit PIN."""
+    raw = f"{mobile.strip()}:{pin.strip()}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _execute_with_retry(query_fn, retries: int = 3, delay: float = 1.0) -> Any:
+    """Execute a Supabase PostgREST call with automatic retry on transient network drops."""
+    last_err: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            return query_fn()
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
+            last_err = exc
+            if attempt < retries - 1:
+                time.sleep(delay * (attempt + 1))
+    raise ConnectionError(
+        "Unable to reach Supabase database. Verify SUPABASE_URL in Streamlit Secrets and confirm your Supabase project is Active (not paused)."
+    ) from last_err
 
 
 def auto_login_by_device(supabase: Client, device_id: str) -> Optional[dict[str, Any]]:
-    if not device_id or len(device_id) < 10:
+    """Return the contractor record if this device_id is already bound to a mobile number."""
+    if not device_id:
         return None
-    res = (
-        supabase.table("contractors")
-        .select("*")
-        .eq("active_device_id", device_id)
-        .limit(1)
-        .execute()
-    )
-    return res.data[0] if res.data else None
+
+    def _run():
+        return (
+            supabase.table("contractors")
+            .select("*")
+            .eq("active_device_id", device_id)
+            .limit(1)
+            .execute()
+        )
+
+    res = _execute_with_retry(_run)
+    if res.data:
+        return res.data[0]
+    return None
 
 
 def login_or_register_contractor(
-    supabase: Client,
-    mobile: str,
-    pin: str,
-    device_id: str,
-) -> Tuple[bool, str, Optional[dict[str, Any]]]:
-    mobile = mobile.strip()
-    pin = pin.strip()
+    supabase: Client, mobile: str, pin: str, device_id: str
+) -> tuple[bool, str, Optional[dict[str, Any]]]:
+    """Authenticate an existing contractor or register a new one, enforcing 1 number = 1 mobile."""
+    clean_mobile = "".join(ch for ch in mobile if ch.isdigit())
+    clean_pin = pin.strip()
 
-    if not is_valid_indian_mobile(mobile):
-        return False, "Enter a valid 10-digit Indian mobile number (starts with 6-9).", None
-    if not is_valid_pin(pin):
-        return False, "Enter a 4-digit numeric PIN.", None
-    if not device_id:
-        return False, "Open PreBuild AI from the official app icon so your phone can be verified.", None
+    if len(clean_mobile) != 10:
+        return False, "Please enter a valid 10-digit mobile number.", None
+    if len(clean_pin) != 4 or not clean_pin.isdigit():
+        return False, "Please enter a 4-digit numeric PIN.", None
 
-    now_iso = datetime.now(timezone.utc).isoformat()
-    res = supabase.table("contractors").select("*").eq(MOBILE_COL, mobile).limit(1).execute()
+    pin_digest = hash_pin(clean_mobile, clean_pin)
 
-    # 1. New Contractor -> Create account & lock to this phone
-    if not res.data:
-        new_row = {
-            MOBILE_COL: mobile,
-            "credits": FREE_STARTER_CREDITS,
-            "pin_hash": hash_pin(pin),
-            "active_device_id": device_id,
-            "job_status": "idle",
-            "updated_at": now_iso,
-        }
-        inserted = supabase.table("contractors").insert(new_row).execute()
-        return True, "Account created and locked to this mobile!", inserted.data[0]
-
-    user = res.data[0]
-    existing_device = user.get("active_device_id")
-    existing_pin_hash = user.get("pin_hash")
-
-    # 2. Enforce One-Mobile-One-Number Lock
-    if existing_device and existing_device != device_id:
+    def _fetch():
         return (
-            False,
-            "🔒 This mobile number is already locked to another phone (1 number = 1 mobile). "
-            "Contact PreBuild AI support on WhatsApp to reset your device.",
-            None,
-        )
-
-    # 3. Existing account created before PIN update -> Save PIN & lock phone now
-    if not existing_pin_hash:
-        updated = (
             supabase.table("contractors")
-            .update({
-                "pin_hash": hash_pin(pin),
-                "active_device_id": device_id,
-                "updated_at": now_iso,
-            })
-            .eq(MOBILE_COL, mobile)
+            .select("*")
+            .eq("mobile", clean_mobile)
+            .limit(1)
             .execute()
         )
-        return True, "PIN created and locked to this phone!", updated.data[0]
 
-    # 4. Returning contractor on same phone -> Verify PIN
-    if not verify_pin(pin, existing_pin_hash):
-        return False, "Wrong 4-digit PIN. Please try again.", None
+    existing = _execute_with_retry(_fetch)
 
-    if not existing_device:
-        supabase.table("contractors").update({
-            "active_device_id": device_id,
-            "updated_at": now_iso,
-        }).eq(MOBILE_COL, mobile).execute()
+    if existing.data:
+        user = existing.data[0]
+        if user.get("pin_hash") != pin_digest:
+            return False, "Incorrect 4-digit Secret PIN for this mobile number.", None
 
-    return True, "Welcome back!", user
+        bound_device = user.get("active_device_id") or ""
+        if bound_device and bound_device != device_id:
+            return (
+                False,
+                "This mobile number is already locked to another phone (1 number = 1 mobile). Contact PreBuild AI support on WhatsApp to reset your device.",
+                None,
+            )
 
+        if not bound_device:
+            def _bind():
+                return (
+                    supabase.table("contractors")
+                    .update({"active_device_id": device_id})
+                    .eq("mobile", clean_mobile)
+                    .execute()
+                )
 
-def update_job_status(
-    supabase: Client,
-    mobile: str,
-    status: str,
-    filename: Optional[str] = None,
-) -> None:
-    payload: dict[str, Any] = {
-        "job_status": status,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+            updated = _execute_with_retry(_bind)
+            if updated.data:
+                user = updated.data[0]
+
+        return True, "Logged in successfully.", user
+
+    new_record = {
+        "mobile": clean_mobile,
+        "pin_hash": pin_digest,
+        "active_device_id": device_id,
+        "credits": 1,
     }
-    if filename is not None:
-        payload["last_job_filename"] = filename
-    supabase.table("contractors").update(payload).eq(MOBILE_COL, mobile).execute()
+
+    def _insert():
+        return supabase.table("contractors").insert(new_record).execute()
+
+    created = _execute_with_retry(_insert)
+    user_data = created.data[0] if created.data else new_record
+    return True, "Account registered and locked to this device.", user_data
+
+
+def deduct_credit(supabase: Client, mobile: str, current_credits: int) -> int:
+    """Deduct 1 scan credit only after a successful AI tender analysis."""
+    new_credits = max(0, current_credits - 1)
+
+    def _update():
+        return (
+            supabase.table("contractors")
+            .update({"credits": new_credits})
+            .eq("mobile", mobile)
+            .execute()
+        )
+
+    _execute_with_retry(_update)
+    return new_credits
