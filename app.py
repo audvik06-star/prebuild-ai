@@ -214,11 +214,40 @@ Use these exact 5 headings with both English and Telugu bullet points under each
 TENDER DOCUMENT TEXT:
 {pdf_text[:180000]}
 """
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-    )
-    return response.text or "No analysis generated."
+    candidate_models = [
+        "gemini-3.5-flash",
+        "gemini-3-flash-preview",
+        "gemini-2.5-pro",
+    ]
+    try:
+        for m in client.models.list():
+            name = getattr(m, "name", "").replace("models/", "")
+            actions = getattr(m, "supported_actions", []) or []
+            if (
+                "flash" in name.lower()
+                and "generateContent" in actions
+                and name not in candidate_models
+            ):
+                candidate_models.append(name)
+    except Exception:
+        pass
+
+    last_err: Optional[Exception] = None
+    for model_name in candidate_models:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+            )
+            if response.text:
+                return response.text
+        except Exception as exc:
+            last_err = exc
+            if "404" in str(exc) or "NOT_FOUND" in str(exc):
+                continue
+            raise
+
+    raise RuntimeError(f"No working Gemini model found: {last_err}")
 
 
 def background_worker(
